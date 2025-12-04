@@ -4,7 +4,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_sc
 
 def evaluate(pred_path, gold_path):
     pred_df = pd.read_csv(pred_path)
-    gold_df = pd.read_csv(gold_path)
+    gold_df = pd.read_parquet(gold_path)
 
     merged = pd.merge(gold_df, pred_df, on="ID")
     if merged.empty:
@@ -32,7 +32,7 @@ def evaluate(pred_path, gold_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--predictions", required=True, help="Path to submission .csv")
-    parser.add_argument("--gold", required=True, help="Path to gold labels .csv (with columns: id,label)")
+    parser.add_argument("--gold", required=True, help="Path to gold labels .parquet (with columns: id,label)")
     args = parser.parse_args()
 
     evaluate(args.predictions, args.gold)

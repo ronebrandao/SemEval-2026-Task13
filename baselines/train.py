@@ -136,7 +136,7 @@ class CodeBERTTrainer:
             warmup_steps=500,
             weight_decay=0.01,
             logging_dir='./logs',
-            logging_steps=100,
+            logging_steps=500,
             evaluation_strategy="steps",
             eval_steps=500,
             save_strategy="steps",

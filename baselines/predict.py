@@ -23,7 +23,8 @@ def load_model_and_tokenizer(model_path, device):
 
 def collate_fn(batch, tokenizer, max_length):
     codes = [item["code"] for item in batch]
-    ids = [item["ID"] for item in batch]
+    # Use the index column as ID instead of looking for 'ID' column
+    ids = [item["__index_level_0__"] for item in batch]
     encodings = tokenizer(
         codes,
         truncation=True,
