@@ -14,6 +14,16 @@ import os
 import argparse
 from datetime import datetime
 
+# Try to import cuML for GPU acceleration
+try:
+    from cuml.feature_extraction.text import TfidfVectorizer as cuTfidfVectorizer
+    import cupy as cp
+    CUML_AVAILABLE = True
+except ImportError:
+    CUML_AVAILABLE = False
+    cuTfidfVectorizer = None
+    cp = None
+
 # Start overall timing
 start_time = time.time()
 
@@ -43,7 +53,21 @@ parser.add_argument(
     default="",
     help="If set, reuse/save TF-IDF vectorizer joblib in this directory (no matrix caching)",
 )
+parser.add_argument(
+    "--use_gpu",
+    action="store_true",
+    help="Use GPU-accelerated TF-IDF via cuML (requires RAPIDS cuML installed)",
+)
 args = parser.parse_args()
+
+# Validate GPU option
+if args.use_gpu and not CUML_AVAILABLE:
+    print("WARNING: --use_gpu requested but cuML is not available.")
+    print("         Install with: conda install -c rapidsai -c conda-forge -c nvidia cuml")
+    print("         Falling back to CPU sklearn TfidfVectorizer")
+    args.use_gpu = False
+elif args.use_gpu:
+    print(">>> GPU acceleration enabled (using cuML)")
 
 RUNS_ROOT = os.path.join("light_gbm", "runs")
 os.makedirs(RUNS_ROOT, exist_ok=True)
@@ -218,6 +242,41 @@ def tfidf_joblib_path(analyzer: str):
     # One file per analyzer so char and char_wb don't collide
     return os.path.join(args.cache_dir, f"tfidf_{analyzer}.joblib")
 
+def tfidf_matrix_path(analyzer: str, split: str):
+    """Return the path to the cached TF-IDF transformed matrix, if cache_dir was provided."""
+    if not args.cache_dir:
+        return None
+    os.makedirs(args.cache_dir, exist_ok=True)
+    return os.path.join(args.cache_dir, f"tfidf_{analyzer}_{split}.npz")
+
+
+def convert_cupy_to_sparse(cupy_matrix):
+    """Convert cuML/cupy matrix to scipy sparse matrix"""
+    if cp is None:
+        return cupy_matrix  # Not using GPU, already scipy sparse
+    
+    # Check if it's a cupy array or sparse matrix
+    if hasattr(cupy_matrix, 'get'):
+        # cuML returns cupy arrays/sparse matrices, convert to numpy then scipy sparse
+        try:
+            # Try to get as numpy array (works for both dense and sparse cupy arrays)
+            numpy_matrix = cupy_matrix.get()  # Transfer from GPU to CPU
+            
+            # If it's already a scipy sparse matrix, return it
+            if sparse.issparse(numpy_matrix):
+                return numpy_matrix
+            
+            # If it's a numpy array, convert to sparse (cuML may return dense for small matrices)
+            if isinstance(numpy_matrix, np.ndarray):
+                return sparse.csr_matrix(numpy_matrix)
+            
+            return numpy_matrix
+        except AttributeError:
+            # If .get() doesn't work, it might already be a scipy sparse matrix
+            return cupy_matrix
+    else:
+        return cupy_matrix  # Already scipy sparse or numpy array
+
 
 def get_tfidf(analyzer: str):
     key = f"tfidf_{analyzer}"
@@ -225,22 +284,77 @@ def get_tfidf(analyzer: str):
         return TFIDF[key]
 
     joblib_path = tfidf_joblib_path(analyzer)
+    
+    # Choose vectorizer class based on GPU availability
+    if args.use_gpu and CUML_AVAILABLE:
+        VectorizerClass = cuTfidfVectorizer
+        use_gpu_flag = True
+    else:
+        VectorizerClass = TfidfVectorizer
+        use_gpu_flag = False
 
     # 1) Load vectorizer if available
     if joblib_path and os.path.exists(joblib_path):
         print(f">>> Loading TF-IDF vectorizer from: {joblib_path}")
+        load_start = time.time()
         vec = joblib.load(joblib_path)
-
-        Xtr = vec.transform(X_train_text)
-        Xva = vec.transform(X_val_text)
-        Xte = vec.transform(X_test_text)
+        load_time = time.time() - load_start
+        print(f"    Vectorizer loaded in {load_time:.2f} seconds")
+        
+        # Try to load cached matrices first
+        matrix_paths = {
+            'train': tfidf_matrix_path(analyzer, 'train'),
+            'val': tfidf_matrix_path(analyzer, 'val'),
+            'test': tfidf_matrix_path(analyzer, 'test')
+        }
+        
+        if all(p and os.path.exists(p) for p in matrix_paths.values()):
+            print(f">>> Loading cached TF-IDF matrices...")
+            transform_start = time.time()
+            Xtr = sparse.load_npz(matrix_paths['train'])
+            Xva = sparse.load_npz(matrix_paths['val'])
+            Xte = sparse.load_npz(matrix_paths['test'])
+            transform_time = time.time() - transform_start
+            print(f"    Matrices loaded in {transform_time:.2f} seconds")
+        else:
+            print(f">>> Transforming data (this may take a while)...")
+            transform_start = time.time()
+            Xtr = vec.transform(X_train_text)
+            if use_gpu_flag:
+                Xtr = convert_cupy_to_sparse(Xtr)
+            train_time = time.time() - transform_start
+            print(f"    Train transform: {train_time:.2f} seconds")
+            val_start = time.time()
+            Xva = vec.transform(X_val_text)
+            if use_gpu_flag:
+                Xva = convert_cupy_to_sparse(Xva)
+            val_time = time.time() - val_start
+            print(f"    Val transform: {val_time:.2f} seconds")
+            test_start = time.time()
+            Xte = vec.transform(X_test_text)
+            if use_gpu_flag:
+                Xte = convert_cupy_to_sparse(Xte)
+            test_time = time.time() - test_start
+            print(f"    Test transform: {test_time:.2f} seconds")
+            transform_time = time.time() - transform_start
+            print(f"    All transforms completed in {transform_time:.2f} seconds")
+            
+            # Cache the matrices for next time
+            if args.cache_dir:
+                print(f">>> Caching transformed matrices...")
+                sparse.save_npz(matrix_paths['train'], Xtr)
+                sparse.save_npz(matrix_paths['val'], Xva)
+                sparse.save_npz(matrix_paths['test'], Xte)
 
         TFIDF[key] = (vec, Xtr, Xva, Xte)
         return TFIDF[key]
 
     # 2) Otherwise fit a new vectorizer and optionally save it
-    print(f">>> Building TF-IDF ({analyzer})...")
-    vec = TfidfVectorizer(
+    gpu_msg = " (GPU-accelerated)" if use_gpu_flag else ""
+    print(f">>> Building TF-IDF ({analyzer}){gpu_msg}...")
+    vec = VectorizerClass(
+        device_type="cuda",   # or "gpu" (OpenCL)
+        gpu_device_id=0,      # GPU device ID (0 for first GPU, 1 for second, etc.)
         analyzer=analyzer,
         ngram_range=(3, 6),
         min_df=3,
@@ -250,13 +364,41 @@ def get_tfidf(analyzer: str):
         max_features=200_000,
     )
 
+    fit_start = time.time()
     Xtr = vec.fit_transform(X_train_text)
+    if use_gpu_flag:
+        Xtr = convert_cupy_to_sparse(Xtr)
+    fit_time = time.time() - fit_start
+    print(f"    Fit+transform train: {fit_time:.2f} seconds")
+    val_start = time.time()
     Xva = vec.transform(X_val_text)
+    if use_gpu_flag:
+        Xva = convert_cupy_to_sparse(Xva)
+    val_time = time.time() - val_start
+    print(f"    Transform val: {val_time:.2f} seconds")
+    test_start = time.time()
     Xte = vec.transform(X_test_text)
+    if use_gpu_flag:
+        Xte = convert_cupy_to_sparse(Xte)
+    test_time = time.time() - test_start
+    print(f"    Transform test: {test_time:.2f} seconds")
+    total_time = time.time() - fit_start
+    print(f"    Total fit+transform: {total_time:.2f} seconds")
 
     if joblib_path:
         print(f">>> Saving TF-IDF vectorizer to: {joblib_path}")
         joblib.dump(vec, joblib_path)
+        
+        # Also cache the transformed matrices
+        print(f">>> Caching transformed matrices...")
+        matrix_paths = {
+            'train': tfidf_matrix_path(analyzer, 'train'),
+            'val': tfidf_matrix_path(analyzer, 'val'),
+            'test': tfidf_matrix_path(analyzer, 'test')
+        }
+        sparse.save_npz(matrix_paths['train'], Xtr)
+        sparse.save_npz(matrix_paths['val'], Xva)
+        sparse.save_npz(matrix_paths['test'], Xte)
 
     TFIDF[key] = (vec, Xtr, Xva, Xte)
     return TFIDF[key]
@@ -400,6 +542,8 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     # Train
     train_start = time.time()
     clf = LGBMClassifier(
+        device_type="cuda",   # or "gpu" (OpenCL)
+        gpu_device_id=0,
         objective="binary",
         n_estimators=args.n_estimators,
         learning_rate=0.03,
