@@ -17,6 +17,7 @@ import random
 import logging
 import sys
 import hashlib
+import re
 
 # Optional Weights & Biases (wandb) integration
 try:
@@ -65,6 +66,16 @@ parser.add_argument("--tfidf_analyzer", type=str, default="char", choices=["char
                     help="TF-IDF analyzer; char_wb often reduces noise")
 parser.add_argument("--ablation", action="store_true",
                     help="Run the 4 standard ablations and save each to its own folder")
+parser.add_argument(
+    "--no_balance",
+    action="store_true",
+    help="Disable language downsampling/balancing (use full dataset as-is)",
+)
+parser.add_argument(
+    "--loo_language_out",
+    action="store_true",
+    help="Run leave-one-language-out evaluation on the TRAIN split (each language held out once as validation)",
+)
 
 # Extra LightGBM hyperparameters
 parser.add_argument("--n_estimators", type=int, default=3000,
@@ -290,36 +301,41 @@ logger.info("PHASE 2: Dataset Balancing")
 logger.info("=" * 80)
 logger.info(f"Target language proportions: {TARGET_LANGUAGE_PROPORTIONS}")
 
-# Balance train and validation datasets
-logger.info("")
-logger.info("Balancing TRAINING dataset...")
-train_indices = balance_dataset_by_language(lang_train, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
-logger.info("")
-logger.info("Balancing VALIDATION dataset...")
-val_indices = balance_dataset_by_language(lang_val, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
+if args.no_balance:
+    logger.info("Balancing disabled via --no_balance. Using full train/validation splits as-is.")
+    train_indices = None
+    val_indices = None
+else:
+    # Balance train and validation datasets
+    logger.info("")
+    logger.info("Balancing TRAINING dataset...")
+    train_indices = balance_dataset_by_language(lang_train, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
+    logger.info("")
+    logger.info("Balancing VALIDATION dataset...")
+    val_indices = balance_dataset_by_language(lang_val, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
 
-# Apply filtering to all data arrays
-logger.info("")
-logger.info("Applying dataset balancing filters...")
-if train_indices is not None:
-    logger.info(f"  Filtering training set: {len(X_train_text):,} -> {len(train_indices):,} samples")
-    X_train_text = [X_train_text[i] for i in train_indices]
-    y_train = [y_train[i] for i in train_indices]
-    if lang_train is not None:
-        lang_train = [lang_train[i] for i in train_indices]
-    if gen_train is not None:
-        gen_train = [gen_train[i] for i in train_indices]
-    logger.info(f"  ✓ Training set filtered: {len(X_train_text):,} samples")
+    # Apply filtering to all data arrays
+    logger.info("")
+    logger.info("Applying dataset balancing filters...")
+    if train_indices is not None:
+        logger.info(f"  Filtering training set: {len(X_train_text):,} -> {len(train_indices):,} samples")
+        X_train_text = [X_train_text[i] for i in train_indices]
+        y_train = [y_train[i] for i in train_indices]
+        if lang_train is not None:
+            lang_train = [lang_train[i] for i in train_indices]
+        if gen_train is not None:
+            gen_train = [gen_train[i] for i in train_indices]
+        logger.info(f"  ✓ Training set filtered: {len(X_train_text):,} samples")
 
-if val_indices is not None:
-    logger.info(f"  Filtering validation set: {len(X_val_text):,} -> {len(val_indices):,} samples")
-    X_val_text = [X_val_text[i] for i in val_indices]
-    y_val = [y_val[i] for i in val_indices]
-    if lang_val is not None:
-        lang_val = [lang_val[i] for i in val_indices]
-    if gen_val is not None:
-        gen_val = [gen_val[i] for i in val_indices]
-    logger.info(f"  ✓ Validation set filtered: {len(X_val_text):,} samples")
+    if val_indices is not None:
+        logger.info(f"  Filtering validation set: {len(X_val_text):,} -> {len(val_indices):,} samples")
+        X_val_text = [X_val_text[i] for i in val_indices]
+        y_val = [y_val[i] for i in val_indices]
+        if lang_val is not None:
+            lang_val = [lang_val[i] for i in val_indices]
+        if gen_val is not None:
+            gen_val = [gen_val[i] for i in val_indices]
+        logger.info(f"  ✓ Validation set filtered: {len(X_val_text):,} samples")
 
 # -----------------------------
 # TF-IDF cache fingerprint
@@ -742,6 +758,17 @@ def compute_lang_weights():
 # ---------------------------
 # W&B helpers
 # ---------------------------
+
+def sanitize_wandb_name(name: str) -> str:
+    """Sanitize a string for W&B artifact/run names.
+
+    W&B artifact names may only contain alphanumerics, dashes, underscores, and dots.
+    """
+    # Replace any invalid char sequence with a single underscore
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(name))
+    # Avoid leading/trailing underscores/dots from odd inputs
+    safe = safe.strip("_.-")
+    return safe or "unnamed"
 def start_wandb_if_enabled(run_name: str, run_dir: str, cfg: dict):
     if not getattr(args, "wandb", False):
         return None
@@ -818,6 +845,132 @@ def wandb_lgbm_callback(log_every: int = 50):
     # LightGBM expects callbacks to have an 'order' attribute
     _cb.order = 10
     return _cb
+
+
+# -----------------------------------------------------------
+# Leave-One-Language-Out evaluation over TRAIN split
+# -----------------------------------------------------------
+def run_leave_one_language_out(feature_mode: str, tfidf_analyzer: str, base_run_name: str):
+    """Train on all but one language from TRAIN split; validate on the held-out language.
+
+    This is meant to simulate generalization to unseen languages.
+
+    Note: This reuses `run_experiment` by temporarily overwriting the global split variables
+    (X_train_text/y_train/lang_train/gen_train and X_val_text/y_val/lang_val/gen_val) per fold.
+    """
+    global X_train_text, y_train, lang_train, gen_train
+    global X_val_text, y_val, lang_val, gen_val
+    global TFIDF, STYLE, META
+    global TFIDF_CACHE_FP
+    global train_indices, val_indices
+
+    if lang_train is None:
+        raise RuntimeError("Cannot run --loo_language_out because 'language' column is missing in the TRAIN split")
+
+    # Snapshot originals
+    X_train_text_orig = list(X_train_text)
+    y_train_orig = list(y_train)
+    lang_train_orig = list(lang_train) if lang_train is not None else None
+    gen_train_orig = list(gen_train) if gen_train is not None else None
+
+    X_val_text_orig = list(X_val_text)
+    y_val_orig = list(y_val)
+    lang_val_orig = list(lang_val) if lang_val is not None else None
+    gen_val_orig = list(gen_val) if gen_val is not None else None
+
+    # Use TRAIN split only for fold generation
+    unique_langs = sorted(set(lang_train_orig))
+
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("LEAVE-ONE-LANGUAGE-OUT EVALUATION")
+    logger.info("=" * 80)
+    logger.info(f"Languages in TRAIN: {unique_langs}")
+    logger.info(f"Total folds: {len(unique_langs)}")
+
+    fold_reports = []
+
+    try:
+        for fold_i, hold_lang in enumerate(unique_langs, 1):
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info(f"Fold {fold_i}/{len(unique_langs)} — holding out language: {hold_lang}")
+            logger.info("-" * 80)
+
+            # Indices relative to the ORIGINAL train split
+            idx_hold = [i for i, l in enumerate(lang_train_orig) if l == hold_lang]
+            idx_train = [i for i, l in enumerate(lang_train_orig) if l != hold_lang]
+
+            # Overwrite globals so `run_experiment` uses the fold splits
+            X_train_text = [X_train_text_orig[i] for i in idx_train]
+            y_train = [y_train_orig[i] for i in idx_train]
+            lang_train = [lang_train_orig[i] for i in idx_train] if lang_train_orig is not None else None
+            gen_train = [gen_train_orig[i] for i in idx_train] if gen_train_orig is not None else None
+
+            X_val_text = [X_train_text_orig[i] for i in idx_hold]
+            y_val = [y_train_orig[i] for i in idx_hold]
+            lang_val = [lang_train_orig[i] for i in idx_hold] if lang_train_orig is not None else None
+            gen_val = [gen_train_orig[i] for i in idx_hold] if gen_train_orig is not None else None
+
+            logger.info(f"  Fold sizes: train={len(X_train_text):,}  val(heldout)={len(X_val_text):,}")
+
+            # For TF-IDF caching fingerprint uniqueness (indices refer to original TRAIN ordering)
+            train_indices = idx_train
+            val_indices = idx_hold
+
+            # Clear feature caches so each fold recomputes on the fold-specific data
+            TFIDF = {}
+            STYLE = None
+            META = None
+
+            # Recompute cache fingerprint for this fold (affects tfidf cache file names)
+            TFIDF_CACHE_FP = compute_tfidf_cache_fingerprint()
+            logger.info(f"  TF-IDF cache fingerprint (fold): {TFIDF_CACHE_FP}")
+
+            # Run a normal experiment using the fold splits
+            fold_name = f"{base_run_name}_loo_holdout_{hold_lang}"
+            rep = run_experiment(feature_mode, tfidf_analyzer, fold_name)
+            rep["heldout_language"] = hold_lang
+            fold_reports.append(rep)
+
+        # Summarize folds
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("LOO SUMMARY")
+        logger.info("=" * 80)
+        vals = [r.get("val_macro_f1", 0.0) for r in fold_reports]
+        tests = [r.get("test_macro_f1", 0.0) for r in fold_reports]
+        if vals:
+            logger.info(f"Val Macro-F1 across folds:  mean={float(np.mean(vals)):.4f}  std={float(np.std(vals)):.4f}")
+        if tests:
+            logger.info(f"Test Macro-F1 across folds: mean={float(np.mean(tests)):.4f}  std={float(np.std(tests)):.4f}")
+
+        # Save a summary json in the runs root
+        summary_path = os.path.join(RUNS_ROOT, f"loo_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{base_run_name}.json")
+        with open(summary_path, "w") as f:
+            json.dump({"folds": fold_reports}, f, indent=2)
+        logger.info(f"Saved LOO summary to: {summary_path}")
+
+    finally:
+        # Restore original globals
+        X_train_text = X_train_text_orig
+        y_train = y_train_orig
+        lang_train = lang_train_orig
+        gen_train = gen_train_orig
+
+        X_val_text = X_val_text_orig
+        y_val = y_val_orig
+        lang_val = lang_val_orig
+        gen_val = gen_val_orig
+
+        # Reset fold indices
+        train_indices = None
+        val_indices = None
+
+        # Clear caches to avoid accidental reuse after LOO
+        TFIDF = {}
+        STYLE = None
+        META = None
 
 
 def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
@@ -1047,7 +1200,8 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
         })
 
         # Save the trained model + key outputs as an artifact
-        art = wandb.Artifact(name=f"lgbm_{run_name}", type="model")
+        artifact_name = sanitize_wandb_name(f"lgbm_{run_name}")
+        art = wandb.Artifact(name=artifact_name, type="model")
         art.add_file(os.path.join(run_dir, "model.joblib"))
         art.add_file(os.path.join(run_dir, "config.json"))
         art.add_file(os.path.join(run_dir, "metrics.json"))
@@ -1067,7 +1221,10 @@ logger.info("=" * 80)
 logger.info("STARTING EXPERIMENTS")
 logger.info("=" * 80)
 
-if args.ablation:
+if args.loo_language_out:
+    logger.info("Running leave-one-language-out evaluation...")
+    run_leave_one_language_out(args.features, args.tfidf_analyzer, args.run_name)
+elif args.ablation:
     # Standard ablation grid
     logger.info("Running 4-way ablation study...")
     grid = [
