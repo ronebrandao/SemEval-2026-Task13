@@ -16,6 +16,7 @@ from datetime import datetime
 import random
 import logging
 import sys
+import hashlib
 
 # Optional Weights & Biases (wandb) integration
 try:
@@ -149,101 +150,120 @@ gen_test  = test_ds["generator"]  if "generator" in test_ds.column_names else No
 
 
 def balance_dataset_by_language(languages, target_proportions, random_seed=42):
-    """
-    Balance dataset to maintain target language proportions by downsampling.
-    
-    This function ensures that the final dataset maintains the specified proportions
-    by keeping all samples from the majority language (Python) and downsampling
-    other languages to match the target proportions.
-    
-    Args:
-        languages: List of language labels for each sample
-        target_proportions: Dict mapping language to target proportion (e.g., {"Python": 0.9146, "C++": 0.0468, "Java": 0.0386})
-        random_seed: Random seed for reproducibility
-    
-    Returns:
-        List of indices to keep in the balanced dataset
+    """Downsample to (approximately) match target language proportions.
+
+    IMPORTANT: This ONLY downsamples. It never upsamples.
+
+    We choose the largest possible total size T such that for every language L in the
+    target set and present in the data:
+
+        round(p_L * T) <= available_count_L
+
+    Then we sample that many examples per language.
+
+    If you want to reduce Python dominance, you must set target_proportions so that
+    Python's share is *lower* than in the raw dataset (e.g., 0.34 instead of 0.91).
     """
     if languages is None:
         return None
-    
-    # Set random seed for reproducibility
+
     random.seed(random_seed)
     np.random.seed(random_seed)
-    
-    # Count samples per language
+
     lang_counts = Counter(languages)
     total_samples = len(languages)
-    
+
     logger.info("")
-    logger.info("Balancing dataset by language proportions...")
+    logger.info("Balancing dataset by language proportions (downsampling-only)...")
     logger.info(f"  Original total samples: {total_samples:,}")
     logger.info("  Original language distribution:")
     for lang, count in sorted(lang_counts.items()):
         prop = count / total_samples * 100
         logger.info(f"    {lang}: {count:,} ({prop:.2f}%)")
-    
-    # Determine how many samples to keep for each language
-    # Strategy: Use Python as the reference (keep all Python samples)
-    # Then calculate how many samples from other languages we need to maintain proportions
+
+    # Only consider languages that are both in the target proportions and present in the data
+    langs_in_scope = [l for l in target_proportions.keys() if l in lang_counts]
+    if not langs_in_scope:
+        logger.warning("  ⚠ No target languages found in dataset; skipping balancing")
+        return None
+
+    # Normalize target proportions over the languages we actually have
+    p_sum = float(sum(target_proportions[l] for l in langs_in_scope))
+    if p_sum <= 0:
+        logger.warning("  ⚠ Invalid target proportions (sum<=0); skipping balancing")
+        return None
+    target_p = {l: float(target_proportions[l]) / p_sum for l in langs_in_scope}
+
+    # Compute maximum feasible total size T (downsampling only)
+    # T <= available_count_L / p_L for all L
+    max_totals = []
+    for l in langs_in_scope:
+        p = target_p[l]
+        if p <= 0:
+            continue
+        max_totals.append(lang_counts[l] / p)
+    if not max_totals:
+        logger.warning("  ⚠ No valid target proportions after filtering; skipping balancing")
+        return None
+
+    T = int(min(max_totals))
+    if T <= 0:
+        logger.warning("  ⚠ Computed target total <= 0; skipping balancing")
+        return None
+
+    # Initial target counts via floor to guarantee feasibility
+    target_counts = {l: int(np.floor(target_p[l] * T)) for l in langs_in_scope}
+
+    # Distribute leftover due to flooring (largest fractional parts first), respecting availability
+    current_total = sum(target_counts.values())
+    leftover = T - current_total
+    if leftover > 0:
+        # Compute fractional remainders
+        remainders = []
+        for l in langs_in_scope:
+            exact = target_p[l] * T
+            frac = exact - np.floor(exact)
+            cap = lang_counts[l] - target_counts[l]
+            if cap > 0:
+                remainders.append((frac, l, cap))
+        remainders.sort(reverse=True)
+
+        i = 0
+        while leftover > 0 and remainders:
+            frac, l, cap = remainders[i]
+            if cap > 0:
+                target_counts[l] += 1
+                leftover -= 1
+                cap -= 1
+                remainders[i] = (frac, l, cap)
+            i = (i + 1) % len(remainders)
+            # stop if nobody has remaining capacity
+            if all(cap_i <= 0 for _, _, cap_i in remainders):
+                break
+
+    # Sample indices per language
     kept_indices = []
-    
-    # Get Python count (should be the majority)
-    python_count = lang_counts.get("Python", 0)
-    if python_count == 0:
-        # If no Python, use the language with the highest count
-        majority_lang = max(lang_counts.items(), key=lambda x: x[1])[0]
-        majority_count = lang_counts[majority_lang]
-        logger.warning(f"  ⚠ No Python found, using {majority_lang} as reference")
-    else:
-        majority_lang = "Python"
-        majority_count = python_count
-    
-    # Calculate target counts for each language based on proportions
-    # If we keep all Python samples, how many of each other language do we need?
-    target_counts = {}
-    for lang, target_prop in target_proportions.items():
-        if lang in lang_counts:
-            # Calculate target count: (target_prop / python_prop) * python_count
-            # This maintains the relative proportions
-            python_prop = target_proportions.get("Python", target_proportions.get(majority_lang, 1.0))
-            if lang == majority_lang:
-                # Keep all samples from the majority language
-                target_counts[lang] = lang_counts[lang]
-            else:
-                # Calculate how many samples needed to maintain proportion
-                target_count = int((target_prop / python_prop) * majority_count)
-                # Don't keep more than we have
-                target_counts[lang] = min(target_count, lang_counts[lang])
-    
-    # Sample indices for each language
-    for lang, target_count in target_counts.items():
-        if lang in lang_counts:
-            actual_count = lang_counts[lang]
-            # Get indices for this language
-            lang_indices = [i for i, l in enumerate(languages) if l == lang]
-            
-            # Randomly sample if we need to downsample
-            if len(lang_indices) > target_count:
-                sampled_indices = random.sample(lang_indices, target_count)
-                logger.info(f"    {lang}: keeping {target_count:,} / {actual_count:,} samples ({target_count/actual_count*100:.2f}%)")
-            else:
-                sampled_indices = lang_indices
-                logger.info(f"    {lang}: keeping all {actual_count:,} samples (target was {target_count:,})")
-            
-            kept_indices.extend(sampled_indices)
+    for l in langs_in_scope:
+        avail = lang_counts[l]
+        k = target_counts[l]
+        lang_indices = [i for i, lab in enumerate(languages) if lab == l]
+        if k < avail:
+            sampled = random.sample(lang_indices, k)
+            logger.info(f"    {l}: keeping {k:,} / {avail:,} samples ({(k/avail*100):.2f}%)")
         else:
-            logger.warning(f"    {lang}: not found in dataset")
-    
-    # Check for languages not in target_proportions
-    other_langs = set(lang_counts.keys()) - set(target_proportions.keys())
+            sampled = lang_indices
+            logger.info(f"    {l}: keeping all {avail:,} samples (target was {k:,})")
+        kept_indices.extend(sampled)
+
+    # Exclude languages outside target_proportions
+    other_langs = set(lang_counts.keys()) - set(langs_in_scope)
     if other_langs:
-        logger.info(f"  Note: Excluding {len(other_langs)} other language(s) not in target proportions: {sorted(other_langs)}")
-    
-    # Sort indices to maintain original order
+        logger.info(
+            f"  Note: Excluding {len(other_langs)} other language(s) not in target proportions: {sorted(other_langs)}"
+        )
+
     kept_indices = sorted(kept_indices)
-    
-    # Report final distribution
+
     final_lang_counts = Counter([languages[i] for i in kept_indices])
     final_total = len(kept_indices)
     logger.info("")
@@ -252,15 +272,16 @@ def balance_dataset_by_language(languages, target_proportions, random_seed=42):
     for lang, count in sorted(final_lang_counts.items()):
         prop = count / final_total * 100
         logger.info(f"    {lang}: {count:,} ({prop:.2f}%)")
-    
+
     return kept_indices
 
 
-# Target proportions based on user's requirements
+# Target proportions for downsampling-only balancing.
+# This intentionally reduces Python dominance.
 TARGET_LANGUAGE_PROPORTIONS = {
-    "Python": 0.9146,
-    "C++": 0.0468,
-    "Java": 0.0386
+    "Python": 0.34,
+    "C++": 0.33,
+    "Java": 0.33,
 }
 
 logger.info("")
@@ -299,6 +320,49 @@ if val_indices is not None:
     if gen_val is not None:
         gen_val = [gen_val[i] for i in val_indices]
     logger.info(f"  ✓ Validation set filtered: {len(X_val_text):,} samples")
+
+# -----------------------------
+# TF-IDF cache fingerprint
+# -----------------------------
+# IMPORTANT:
+# We cache BOTH the vectorizer and the transformed matrices. With dataset balancing/downsampling,
+# reusing a cache created from a different selection would silently mismatch X/y.
+# To prevent that, we compute a short fingerprint from the current dataset selection + TF-IDF params
+# and incorporate it into cache filenames.
+
+def _hash_indices(idxs):
+    if idxs is None:
+        return "none"
+    arr = np.asarray(idxs, dtype=np.int32)
+    # 8-byte digest is enough to avoid collisions in practice for this use-case
+    return hashlib.blake2b(arr.tobytes(), digest_size=8).hexdigest()
+
+
+def compute_tfidf_cache_fingerprint():
+    payload = {
+        "train_n": len(X_train_text),
+        "val_n": len(X_val_text),
+        "test_n": len(X_test_text),
+        "train_indices_hash": _hash_indices(train_indices),
+        "val_indices_hash": _hash_indices(val_indices),
+        "target_language_proportions": TARGET_LANGUAGE_PROPORTIONS,
+        "balance_seed": 42,
+        # TF-IDF params that affect the learned vocab / matrices
+        "tfidf": {
+            "ngram_range": (3, 6),
+            "min_df": 3,
+            "max_df": 0.95,
+            "sublinear_tf": True,
+            "lowercase": False,
+            "max_features": 200_000,
+        },
+    }
+    s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.blake2b(s, digest_size=8).hexdigest()
+
+
+TFIDF_CACHE_FP = compute_tfidf_cache_fingerprint()
+logger.info(f"TF-IDF cache fingerprint: {TFIDF_CACHE_FP}")
 
 def extract_style_features(codes):
     feats = []
@@ -433,14 +497,14 @@ def tfidf_joblib_path(analyzer: str):
         return None
     os.makedirs(args.cache_dir, exist_ok=True)
     # One file per analyzer so char and char_wb don't collide
-    return os.path.join(args.cache_dir, f"tfidf_{analyzer}.joblib")
+    return os.path.join(args.cache_dir, f"tfidf_{analyzer}_{TFIDF_CACHE_FP}.joblib")
 
 def tfidf_matrix_path(analyzer: str, split: str):
     """Return the path to the cached TF-IDF transformed matrix, if cache_dir was provided."""
     if not args.cache_dir:
         return None
     os.makedirs(args.cache_dir, exist_ok=True)
-    return os.path.join(args.cache_dir, f"tfidf_{analyzer}_{split}.npz")
+    return os.path.join(args.cache_dir, f"tfidf_{analyzer}_{TFIDF_CACHE_FP}_{split}.npz")
 
 
 
@@ -700,6 +764,7 @@ def start_wandb_if_enabled(run_name: str, run_dir: str, cfg: dict):
     return wandb.init(**init_kwargs)
 
 
+
 def log_lgbm_evals_to_wandb(clf, log_every: int = 50):
     if wandb is None or wandb.run is None:
         return
@@ -722,6 +787,36 @@ def log_lgbm_evals_to_wandb(clf, log_every: int = 50):
     if getattr(clf, "best_score_", None):
         # best_score_ is a dict; keep it in summary for easy comparison
         wandb.run.summary["best_score"] = clf.best_score_
+
+
+# Stream LightGBM eval metrics to W&B during training
+def wandb_lgbm_callback(log_every: int = 50):
+    """LightGBM callback that streams eval metrics to W&B during training."""
+
+    def _cb(env):
+        if wandb is None or wandb.run is None:
+            return
+
+        step = int(env.iteration) + 1
+        end_it = getattr(env, "end_iteration", None)
+
+        # Log every N rounds and also on the final iteration
+        if step % int(log_every) != 0 and (end_it is None or step != int(end_it)):
+            return
+
+        payload = {}
+        # evaluation_result_list items are tuples:
+        # (data_name, eval_name, result, is_higher_better, stdv)
+        for item in env.evaluation_result_list or []:
+            data_name, eval_name, result = item[0], item[1], item[2]
+            payload[f"{data_name}/{eval_name}"] = float(result)
+
+        if payload:
+            wandb.log(payload, step=step)
+
+    # LightGBM expects callbacks to have an 'order' attribute
+    _cb.order = 10
+    return _cb
 
 
 def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
@@ -819,20 +914,24 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     logger.info("  Evaluation metrics: binary_logloss, auc")
     logger.info("  Logging every 50 iterations")
 
+    callbacks = [
+        log_evaluation(50),
+        early_stopping(
+            stopping_rounds=args.early_stopping_rounds,
+            first_metric_only=True,
+            min_delta=args.early_stopping_min_delta,
+        ),
+    ]
+    if wandb is not None and wandb.run is not None:
+        callbacks.append(wandb_lgbm_callback(args.wandb_log_every))
+
     clf.fit(
         X_train,
         y_train,
         sample_weight=sample_weight,
         eval_set=[(X_train, y_train), (X_val, y_val)],
         eval_metric=["binary_logloss", "auc"],
-        callbacks=[
-            log_evaluation(50),
-            early_stopping(
-                stopping_rounds=args.early_stopping_rounds,
-                first_metric_only=True,
-                min_delta=args.early_stopping_min_delta,
-            ),
-        ],
+        callbacks=callbacks,
     )
     # Log LightGBM learning curves (loss / AUC) to W&B, if enabled
     log_lgbm_evals_to_wandb(clf, log_every=args.wandb_log_every)
