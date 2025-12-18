@@ -757,6 +757,7 @@ def start_wandb_if_enabled(run_name: str, run_dir: str, cfg: dict):
         "config": cfg,
         "dir": run_dir,
         "tags": tags,
+        "settings": wandb.Settings(console="wrap"),
     }
     if args.wandb_entity:
         init_kwargs["entity"] = args.wandb_entity
