@@ -67,11 +67,6 @@ parser.add_argument("--tfidf_analyzer", type=str, default="char", choices=["char
 parser.add_argument("--ablation", action="store_true",
                     help="Run the 4 standard ablations and save each to its own folder")
 parser.add_argument(
-    "--no_balance",
-    action="store_true",
-    help="Disable language downsampling/balancing (use full dataset as-is)",
-)
-parser.add_argument(
     "--loo_language_out",
     action="store_true",
     help="Run leave-one-language-out evaluation on the TRAIN split (each language held out once as validation)",
@@ -160,191 +155,20 @@ gen_val   = val_ds["generator"]   if "generator" in val_ds.column_names else Non
 gen_test  = test_ds["generator"]  if "generator" in test_ds.column_names else None
 
 
-def balance_dataset_by_language(languages, target_proportions, random_seed=42):
-    """Downsample to (approximately) match target language proportions.
-
-    IMPORTANT: This ONLY downsamples. It never upsamples.
-
-    We choose the largest possible total size T such that for every language L in the
-    target set and present in the data:
-
-        round(p_L * T) <= available_count_L
-
-    Then we sample that many examples per language.
-
-    If you want to reduce Python dominance, you must set target_proportions so that
-    Python's share is *lower* than in the raw dataset (e.g., 0.34 instead of 0.91).
-    """
-    if languages is None:
-        return None
-
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-
-    lang_counts = Counter(languages)
-    total_samples = len(languages)
-
-    logger.info("")
-    logger.info("Balancing dataset by language proportions (downsampling-only)...")
-    logger.info(f"  Original total samples: {total_samples:,}")
-    logger.info("  Original language distribution:")
-    for lang, count in sorted(lang_counts.items()):
-        prop = count / total_samples * 100
-        logger.info(f"    {lang}: {count:,} ({prop:.2f}%)")
-
-    # Only consider languages that are both in the target proportions and present in the data
-    langs_in_scope = [l for l in target_proportions.keys() if l in lang_counts]
-    if not langs_in_scope:
-        logger.warning("  ⚠ No target languages found in dataset; skipping balancing")
-        return None
-
-    # Normalize target proportions over the languages we actually have
-    p_sum = float(sum(target_proportions[l] for l in langs_in_scope))
-    if p_sum <= 0:
-        logger.warning("  ⚠ Invalid target proportions (sum<=0); skipping balancing")
-        return None
-    target_p = {l: float(target_proportions[l]) / p_sum for l in langs_in_scope}
-
-    # Compute maximum feasible total size T (downsampling only)
-    # T <= available_count_L / p_L for all L
-    max_totals = []
-    for l in langs_in_scope:
-        p = target_p[l]
-        if p <= 0:
-            continue
-        max_totals.append(lang_counts[l] / p)
-    if not max_totals:
-        logger.warning("  ⚠ No valid target proportions after filtering; skipping balancing")
-        return None
-
-    T = int(min(max_totals))
-    if T <= 0:
-        logger.warning("  ⚠ Computed target total <= 0; skipping balancing")
-        return None
-
-    # Initial target counts via floor to guarantee feasibility
-    target_counts = {l: int(np.floor(target_p[l] * T)) for l in langs_in_scope}
-
-    # Distribute leftover due to flooring (largest fractional parts first), respecting availability
-    current_total = sum(target_counts.values())
-    leftover = T - current_total
-    if leftover > 0:
-        # Compute fractional remainders
-        remainders = []
-        for l in langs_in_scope:
-            exact = target_p[l] * T
-            frac = exact - np.floor(exact)
-            cap = lang_counts[l] - target_counts[l]
-            if cap > 0:
-                remainders.append((frac, l, cap))
-        remainders.sort(reverse=True)
-
-        i = 0
-        while leftover > 0 and remainders:
-            frac, l, cap = remainders[i]
-            if cap > 0:
-                target_counts[l] += 1
-                leftover -= 1
-                cap -= 1
-                remainders[i] = (frac, l, cap)
-            i = (i + 1) % len(remainders)
-            # stop if nobody has remaining capacity
-            if all(cap_i <= 0 for _, _, cap_i in remainders):
-                break
-
-    # Sample indices per language
-    kept_indices = []
-    for l in langs_in_scope:
-        avail = lang_counts[l]
-        k = target_counts[l]
-        lang_indices = [i for i, lab in enumerate(languages) if lab == l]
-        if k < avail:
-            sampled = random.sample(lang_indices, k)
-            logger.info(f"    {l}: keeping {k:,} / {avail:,} samples ({(k/avail*100):.2f}%)")
-        else:
-            sampled = lang_indices
-            logger.info(f"    {l}: keeping all {avail:,} samples (target was {k:,})")
-        kept_indices.extend(sampled)
-
-    # Exclude languages outside target_proportions
-    other_langs = set(lang_counts.keys()) - set(langs_in_scope)
-    if other_langs:
-        logger.info(
-            f"  Note: Excluding {len(other_langs)} other language(s) not in target proportions: {sorted(other_langs)}"
-        )
-
-    kept_indices = sorted(kept_indices)
-
-    final_lang_counts = Counter([languages[i] for i in kept_indices])
-    final_total = len(kept_indices)
-    logger.info("")
-    logger.info(f"  ✓ Final total samples: {final_total:,}")
-    logger.info("  Final language distribution:")
-    for lang, count in sorted(final_lang_counts.items()):
-        prop = count / final_total * 100
-        logger.info(f"    {lang}: {count:,} ({prop:.2f}%)")
-
-    return kept_indices
 
 
-# Target proportions for downsampling-only balancing.
-# This intentionally reduces Python dominance.
-TARGET_LANGUAGE_PROPORTIONS = {
-    "Python": 0.34,
-    "C++": 0.33,
-    "Java": 0.33,
-}
 
-logger.info("")
-logger.info("=" * 80)
-logger.info("PHASE 2: Dataset Balancing")
-logger.info("=" * 80)
-logger.info(f"Target language proportions: {TARGET_LANGUAGE_PROPORTIONS}")
-
-if args.no_balance:
-    logger.info("Balancing disabled via --no_balance. Using full train/validation splits as-is.")
-    train_indices = None
-    val_indices = None
-else:
-    # Balance train and validation datasets
-    logger.info("")
-    logger.info("Balancing TRAINING dataset...")
-    train_indices = balance_dataset_by_language(lang_train, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
-    logger.info("")
-    logger.info("Balancing VALIDATION dataset...")
-    val_indices = balance_dataset_by_language(lang_val, TARGET_LANGUAGE_PROPORTIONS, random_seed=42)
-
-    # Apply filtering to all data arrays
-    logger.info("")
-    logger.info("Applying dataset balancing filters...")
-    if train_indices is not None:
-        logger.info(f"  Filtering training set: {len(X_train_text):,} -> {len(train_indices):,} samples")
-        X_train_text = [X_train_text[i] for i in train_indices]
-        y_train = [y_train[i] for i in train_indices]
-        if lang_train is not None:
-            lang_train = [lang_train[i] for i in train_indices]
-        if gen_train is not None:
-            gen_train = [gen_train[i] for i in train_indices]
-        logger.info(f"  ✓ Training set filtered: {len(X_train_text):,} samples")
-
-    if val_indices is not None:
-        logger.info(f"  Filtering validation set: {len(X_val_text):,} -> {len(val_indices):,} samples")
-        X_val_text = [X_val_text[i] for i in val_indices]
-        y_val = [y_val[i] for i in val_indices]
-        if lang_val is not None:
-            lang_val = [lang_val[i] for i in val_indices]
-        if gen_val is not None:
-            gen_val = [gen_val[i] for i in val_indices]
-        logger.info(f"  ✓ Validation set filtered: {len(X_val_text):,} samples")
+# Always use the full dataset (no downsampling/balancing).
+# Indices are always None, so later code (e.g., TF-IDF cache, LOO) works as expected.
+train_indices = None
+val_indices = None
 
 # -----------------------------
 # TF-IDF cache fingerprint
 # -----------------------------
 # IMPORTANT:
-# We cache BOTH the vectorizer and the transformed matrices. With dataset balancing/downsampling,
-# reusing a cache created from a different selection would silently mismatch X/y.
-# To prevent that, we compute a short fingerprint from the current dataset selection + TF-IDF params
-# and incorporate it into cache filenames.
+# We cache BOTH the vectorizer and the transformed matrices. Since the full dataset is always used,
+# the fingerprint is based on the current dataset split and TF-IDF params.
 
 def _hash_indices(idxs):
     if idxs is None:
@@ -361,8 +185,6 @@ def compute_tfidf_cache_fingerprint():
         "test_n": len(X_test_text),
         "train_indices_hash": _hash_indices(train_indices),
         "val_indices_hash": _hash_indices(val_indices),
-        "target_language_proportions": TARGET_LANGUAGE_PROPORTIONS,
-        "balance_seed": 42,
         # TF-IDF params that affect the learned vocab / matrices
         "tfidf": {
             "ngram_range": (3, 6),
