@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import f1_score, classification_report
 from sklearn.preprocessing import OneHotEncoder
@@ -13,7 +13,6 @@ from collections import Counter
 import os
 import argparse
 from datetime import datetime
-import random
 import logging
 import sys
 import hashlib
@@ -106,19 +105,62 @@ def make_run_dir(name: str) -> str:
 logger.info("=" * 80)
 logger.info("PHASE 1: Dataset Loading")
 logger.info("=" * 80)
-load_start = time.time()
-logger.info("Loading dataset from Hugging Face: DaniilOr/SemEval-2026-Task13 (Task A)")
-ds = load_dataset("DaniilOr/SemEval-2026-Task13", "A")
-load_time = time.time() - load_start
-logger.info(f"✓ Dataset loaded successfully in {load_time:.2f} seconds")
 
-logger.debug(f"Dataset structure: {ds}")
+# TRAIN: juniorrios/100evaltask13 (25k JSONL)
+logger.info("Loading TRAIN dataset from Hugging Face: juniorrios/100evaltask13 (25k)")
+train_load_start = time.time()
 
-train_ds = ds["train"]        # backed by task_a_training_set_1.parquet
-val_ds   = ds["validation"]   # backed by task_a_validation_set.parquet
-test_ds  = ds["test"]         # backed by task_a_test_set.parquet
+# Bypass HuggingFace's problematic type inference by loading JSONL directly
+# This avoids the casting error with null-only columns (generator)
+from datasets import Features, Value
+from huggingface_hub import hf_hub_download
 
-logger.info(f"Dataset splits loaded:")
+logger.info("Downloading JSONL file directly to bypass type inference issues...")
+# Download the file directly from HuggingFace
+jsonl_path = hf_hub_download(
+    repo_id="juniorrios/100evaltask13",
+    filename="downsample_train_25k_concat.jsonl",
+    repo_type="dataset",
+)
+
+# Read JSONL file and filter out problematic columns
+logger.info("Reading JSONL file and filtering columns...")
+rows = []
+with open(jsonl_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        if line.strip():
+            example = json.loads(line)
+            # Remove generator and orig_dataset_idx before creating dataset
+            filtered_example = {k: v for k, v in example.items() 
+                             if k not in ["generator", "orig_dataset_idx"]}
+            rows.append(filtered_example)
+
+# Create dataset with explicit schema to avoid type inference issues
+logger.info("Creating dataset with explicit schema...")
+train_features = Features({
+    "code": Value("string"),
+    "label": Value("int64"),
+    "human_machine": Value("string"),
+    "cluster": Value("int64"),
+    "language": Value("string"),
+})
+train_ds = Dataset.from_list(rows, features=train_features)
+train_load_time = time.time() - train_load_start
+logger.info(f"✓ Train dataset loaded successfully in {train_load_time:.2f} seconds")
+logger.info(f"Train columns: {train_ds.column_names}")
+
+# VALIDATION/TEST: DaniilOr/SemEval-2026-Task13 (Task A)
+logger.info("Loading VALIDATION/TEST dataset from Hugging Face: DaniilOr/SemEval-2026-Task13 (Task A)")
+eval_load_start = time.time()
+ds_eval = load_dataset("DaniilOr/SemEval-2026-Task13", "A")
+eval_load_time = time.time() - eval_load_start
+logger.info(f"✓ Validation/Test dataset loaded successfully in {eval_load_time:.2f} seconds")
+logger.debug(f"Validation/Test dataset structure: {ds_eval}")
+
+val_ds   = ds_eval["validation"]   # backed by task_a_validation_set.parquet
+test_ds  = ds_eval["test"]         # backed by task_a_test_set.parquet
+
+logger.info("Dataset splits loaded:")
 logger.info(f"  - Train:      {len(train_ds):,} samples")
 logger.info(f"  - Validation: {len(val_ds):,} samples")
 logger.info(f"  - Test:       {len(test_ds):,} samples")
@@ -153,9 +195,6 @@ lang_test  = test_ds["language"]  if "language" in test_ds.column_names else Non
 gen_train = train_ds["generator"] if "generator" in train_ds.column_names else None
 gen_val   = val_ds["generator"]   if "generator" in val_ds.column_names else None
 gen_test  = test_ds["generator"]  if "generator" in test_ds.column_names else None
-
-
-
 
 
 # Always use the full dataset (no downsampling/balancing).
@@ -808,13 +847,15 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
         "lgbm": {
             "n_estimators": args.n_estimators,
             "learning_rate": 0.03,
-            "num_leaves": 31,
-            "min_child_samples": 200,
+            "num_leaves": 127,
+            "min_child_samples": 80,
             "subsample": 0.7,
             "subsample_freq": 1,
+            "min_split_gain": 0.01,
             "colsample_bytree": 0.7,
             "reg_alpha": 1.0,
-            "reg_lambda": 5.0,
+            "reg_lambda": 15.0,
+            "class_weight": "balanced",
         },
     }
     with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -872,19 +913,22 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
         force_col_wise=True,
         n_estimators=args.n_estimators,
         learning_rate=0.03,
-        num_leaves=31,
-        min_child_samples=200,
+        num_leaves=127,
+        min_child_samples=80,
         subsample=0.7,
         subsample_freq=1,
+        min_split_gain=0.01,
         colsample_bytree=0.7,
         reg_alpha=1.0,
-        reg_lambda=5.0,
+        reg_lambda=15.0,
+        class_weight="balanced",
         n_jobs=-1,
     )
     logger.info("  Hyperparameters:")
-    logger.info(f"    learning_rate={0.03}, num_leaves={31}, min_child_samples={200}")
+    logger.info(f"    learning_rate={0.03}, num_leaves={127}, min_child_samples={80}")
     logger.info(f"    subsample={0.7}, colsample_bytree={0.7}")
-    logger.info(f"    reg_alpha={1.0}, reg_lambda={5.0}")
+    logger.info(f"    min_split_gain={0.01}")
+    logger.info(f"    reg_alpha={1.0}, reg_lambda={15.0}, class_weight=balanced")
     logger.info("")
     logger.info("Starting training (this may take a while)...")
     logger.info("  Evaluation metrics: binary_logloss, auc")
@@ -906,7 +950,7 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
         y_train,
         sample_weight=sample_weight,
         eval_set=[(X_train, y_train), (X_val, y_val)],
-        eval_metric=["binary_logloss", "auc"],
+        eval_metric=["auc", "binary_logloss"],
         callbacks=callbacks,
     )
     # Log LightGBM learning curves (loss / AUC) to W&B, if enabled
@@ -935,17 +979,17 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     val_proba = clf.predict_proba(X_val)[:, 1]
     ths = np.linspace(0.05, 0.95, 181)
     best_th = 0.5
-    best_f1 = -1.0
-    for t in ths:
-        preds = (val_proba >= t).astype(int)
-        f1 = f1_score(y_val, preds, average="macro")
-        if f1 > best_f1:
-            best_f1 = f1
-            best_th = float(t)
-    logger.info(f"  ✓ Best threshold: {best_th:.4f} (val Macro-F1: {best_f1:.4f})")
+    # best_f1 = -1.0
+    # for t in ths:
+    #     preds = (val_proba >= t).astype(int)
+    #     f1 = f1_score(y_val, preds, average="macro")
+    #     if f1 > best_f1:
+    #         best_f1 = f1
+    #         best_th = float(t)
+    # logger.info(f"  ✓ Best threshold: {best_th:.4f} (val Macro-F1: {best_f1:.4f})")
 
-    with open(os.path.join(run_dir, "best_threshold.json"), "w") as f:
-        json.dump({"best_threshold": best_th, "val_macro_f1": best_f1}, f, indent=2)
+    # with open(os.path.join(run_dir, "best_threshold.json"), "w") as f:
+    #     json.dump({"best_threshold": best_th, "val_macro_f1": best_f1}, f, indent=2)
 
     # Evaluate
     logger.info("")
