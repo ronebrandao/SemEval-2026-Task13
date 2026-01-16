@@ -24,6 +24,12 @@ try:
 except Exception:
     wandb = None
 
+# Optional Optuna (Bayesian Optimization) integration
+try:
+    import optuna
+except Exception:
+    optuna = None
+
 
 # -----------------------------
 # Logging Setup
@@ -90,6 +96,13 @@ parser.add_argument("--wandb_project", type=str, default="semeval-task13", help=
 parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity/team (optional)")
 parser.add_argument("--wandb_tags", type=str, default="", help="Comma-separated W&B tags (optional)")
 parser.add_argument("--wandb_log_every", type=int, default=50, help="Log eval metrics to W&B every N boosting rounds")
+
+# Optuna (Bayesian optimization) tuning
+parser.add_argument("--optuna", action="store_true", help="Run Bayesian hyperparameter optimization with Optuna")
+parser.add_argument("--optuna_trials", type=int, default=50, help="Number of Optuna trials")
+parser.add_argument("--optuna_timeout", type=int, default=0, help="Timeout in seconds for Optuna (0 = no timeout)")
+parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for Optuna sampler")
+
 args = parser.parse_args()
 
 RUNS_ROOT = os.path.join("light_gbm", "runs")
@@ -616,6 +629,25 @@ def compute_lang_weights():
     return w
 
 
+# Helper: threshold tuning for Macro-F1
+def tune_threshold_for_macro_f1(y_true, proba):
+    """Pick a probability threshold that maximizes Macro-F1 on a validation set."""
+    ths = np.linspace(0.05, 0.95, 181)
+    best_th = 0.5
+    best_f1 = -1.0
+    y_true = np.asarray(y_true)
+    proba = np.asarray(proba)
+
+    for t in ths:
+        preds = (proba >= t).astype(int)
+        f1 = f1_score(y_true, preds, average="macro")
+        if f1 > best_f1:
+            best_f1 = float(f1)
+            best_th = float(t)
+
+    return best_th, best_f1
+
+
 # ---------------------------
 # W&B helpers
 # ---------------------------
@@ -834,7 +866,7 @@ def run_leave_one_language_out(feature_mode: str, tfidf_analyzer: str, base_run_
         META = None
 
 
-def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
+def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str, lgbm_overrides: dict | None = None):
     run_dir = make_run_dir(run_name)
 
     # Persist config for reproducibility
@@ -858,10 +890,15 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
             "class_weight": "balanced",
         },
     }
+
+    # Apply optional LightGBM hyperparameter overrides (e.g., from Optuna)
+    if lgbm_overrides:
+        cfg["lgbm"].update({k: v for k, v in lgbm_overrides.items() if v is not None})
+
+    cfg["run_dir"] = run_dir
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
-    cfg["run_dir"] = run_dir
     wb_run = start_wandb_if_enabled(run_name=run_name, run_dir=run_dir, cfg=cfg)
     if wb_run:
         logger.info(f"✓ Weights & Biases tracking enabled: {wb_run.url}")
@@ -873,7 +910,7 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     logger.info(f"  Features:        {feature_mode}")
     logger.info(f"  TF-IDF Analyzer: {tfidf_analyzer}")
     logger.info(f"  Output Directory: {run_dir}")
-    logger.info(f"  Max Estimators:  {args.n_estimators}")
+    logger.info(f"  Max Estimators:  {cfg['lgbm']['n_estimators']}")
     logger.info(f"  Early Stopping:  {args.early_stopping_rounds} rounds, min_delta={args.early_stopping_min_delta}")
 
     # Build matrices
@@ -908,27 +945,36 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     logger.info("=" * 80)
     logger.info("Initializing LightGBM classifier...")
     train_start = time.time()
-    clf = LGBMClassifier(
-        objective="binary",
-        force_col_wise=True,
-        n_estimators=args.n_estimators,
-        learning_rate=0.03,
-        num_leaves=127,
-        min_child_samples=80,
-        subsample=0.7,
-        subsample_freq=1,
-        min_split_gain=0.01,
-        colsample_bytree=0.7,
-        reg_alpha=1.0,
-        reg_lambda=15.0,
-        class_weight="balanced",
-        n_jobs=-1,
-    )
+
+    lgbm_params = {
+        "objective": "binary",
+        "force_col_wise": True,
+        "n_estimators": cfg["lgbm"]["n_estimators"],
+        "learning_rate": cfg["lgbm"]["learning_rate"],
+        "num_leaves": cfg["lgbm"]["num_leaves"],
+        "min_child_samples": cfg["lgbm"]["min_child_samples"],
+        "subsample": cfg["lgbm"]["subsample"],
+        "subsample_freq": cfg["lgbm"]["subsample_freq"],
+        "min_split_gain": cfg["lgbm"]["min_split_gain"],
+        "colsample_bytree": cfg["lgbm"]["colsample_bytree"],
+        "reg_alpha": cfg["lgbm"]["reg_alpha"],
+        "reg_lambda": cfg["lgbm"]["reg_lambda"],
+        "class_weight": cfg["lgbm"]["class_weight"],
+        "n_jobs": -1,
+    }
+
+    clf = LGBMClassifier(**lgbm_params)
     logger.info("  Hyperparameters:")
-    logger.info(f"    learning_rate={0.03}, num_leaves={127}, min_child_samples={80}")
-    logger.info(f"    subsample={0.7}, colsample_bytree={0.7}")
-    logger.info(f"    min_split_gain={0.01}")
-    logger.info(f"    reg_alpha={1.0}, reg_lambda={15.0}, class_weight=balanced")
+    logger.info(
+        f"    learning_rate={lgbm_params['learning_rate']}, num_leaves={lgbm_params['num_leaves']}, min_child_samples={lgbm_params['min_child_samples']}"
+    )
+    logger.info(
+        f"    subsample={lgbm_params['subsample']}, colsample_bytree={lgbm_params['colsample_bytree']}, subsample_freq={lgbm_params['subsample_freq']}"
+    )
+    logger.info(f"    min_split_gain={lgbm_params['min_split_gain']}")
+    logger.info(
+        f"    reg_alpha={lgbm_params['reg_alpha']}, reg_lambda={lgbm_params['reg_lambda']}, class_weight={lgbm_params['class_weight']}"
+    )
     logger.info("")
     logger.info("Starting training (this may take a while)...")
     logger.info("  Evaluation metrics: binary_logloss, auc")
@@ -963,7 +1009,7 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
         logger.info(f"  ✓ Best iteration: {best_iter} (early stopping triggered)")
     else:
         logger.info(f"  ✓ Training completed in {train_time:.2f} seconds ({train_time/60:.2f} minutes)")
-        logger.info(f"  ✓ Used all {args.n_estimators} iterations")
+        logger.info(f"  ✓ Used all {cfg['lgbm']['n_estimators']} iterations")
 
     logger.info("Saving trained model...")
     joblib.dump(clf, os.path.join(run_dir, "model.joblib"))
@@ -977,19 +1023,11 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     logger.info("Tuning classification threshold on validation set...")
     logger.info("  Searching threshold range: [0.05, 0.95] with 181 candidates")
     val_proba = clf.predict_proba(X_val)[:, 1]
-    ths = np.linspace(0.05, 0.95, 181)
-    best_th = 0.5
-    # best_f1 = -1.0
-    # for t in ths:
-    #     preds = (val_proba >= t).astype(int)
-    #     f1 = f1_score(y_val, preds, average="macro")
-    #     if f1 > best_f1:
-    #         best_f1 = f1
-    #         best_th = float(t)
-    # logger.info(f"  ✓ Best threshold: {best_th:.4f} (val Macro-F1: {best_f1:.4f})")
+    best_th, best_f1 = tune_threshold_for_macro_f1(y_val, val_proba)
+    logger.info(f"  ✓ Best threshold: {best_th:.4f} (val Macro-F1: {best_f1:.4f})")
 
-    # with open(os.path.join(run_dir, "best_threshold.json"), "w") as f:
-    #     json.dump({"best_threshold": best_th, "val_macro_f1": best_f1}, f, indent=2)
+    with open(os.path.join(run_dir, "best_threshold.json"), "w") as f:
+        json.dump({"best_threshold": float(best_th), "val_macro_f1": float(best_f1)}, f, indent=2)
 
     # Evaluate
     logger.info("")
@@ -1079,15 +1117,130 @@ def run_experiment(feature_mode: str, tfidf_analyzer: str, run_name: str):
     return report
 
 
+# -----------------------------------------------------------
+# Optuna (Bayesian Optimization) for LightGBM hyperparameters
+# -----------------------------------------------------------
+
+def run_optuna_search(feature_mode: str, tfidf_analyzer: str, base_run_name: str):
+    """Bayesian optimization of LightGBM hyperparameters using Optuna.
+
+    Optimizes validation Macro-F1, including per-trial threshold tuning.
+    Uses the current TRAIN/VAL split (not LOO).
+    """
+    if optuna is None:
+        raise RuntimeError(
+            "Optuna is not installed but --optuna was provided. Install with: pip install optuna"
+        )
+
+    run_dir = make_run_dir(f"{base_run_name}_optuna")
+
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("OPTUNA BAYESIAN OPTIMIZATION")
+    logger.info("=" * 80)
+    logger.info(f"  Features:        {feature_mode}")
+    logger.info(f"  TF-IDF Analyzer: {tfidf_analyzer}")
+    logger.info(f"  Trials:          {args.optuna_trials}")
+    logger.info(f"  Timeout (sec):   {args.optuna_timeout}")
+    logger.info(f"  Output Dir:      {run_dir}")
+
+    # Build matrices once (reuses caches)
+    logger.info("Building feature matrices once for Optuna...")
+    vec, enc, X_train, X_val, X_test = build_matrix(feature_mode, tfidf_analyzer)
+    logger.info(f"  ✓ Train: {X_train.shape}  Val: {X_val.shape}  Test: {X_test.shape}")
+
+    # Compute weights once
+    sample_weight = compute_lang_weights()
+
+    def objective(trial):
+        # Search space tuned for sparse / high-dim features
+        trial_params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.08, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 512, log=True),
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 400),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq": trial.suggest_int("subsample_freq", 1, 5),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.2),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 50.0, log=True),
+        }
+
+        clf = LGBMClassifier(
+            objective="binary",
+            force_col_wise=True,
+            n_estimators=args.n_estimators,
+            class_weight="balanced",
+            n_jobs=-1,
+            **trial_params,
+        )
+
+        clf.fit(
+            X_train,
+            y_train,
+            sample_weight=sample_weight,
+            eval_set=[(X_val, y_val)],
+            eval_metric=["auc", "binary_logloss"],
+            callbacks=[
+                log_evaluation(0),
+                early_stopping(
+                    stopping_rounds=args.early_stopping_rounds,
+                    first_metric_only=True,
+                    min_delta=args.early_stopping_min_delta,
+                ),
+            ],
+        )
+
+        val_proba = clf.predict_proba(X_val)[:, 1]
+        best_th, best_f1 = tune_threshold_for_macro_f1(y_val, val_proba)
+
+        trial.set_user_attr("best_threshold", float(best_th))
+        trial.set_user_attr("best_iteration", int(getattr(clf, "best_iteration_", 0) or 0))
+
+        return float(best_f1)
+
+    sampler = optuna.samplers.TPESampler(seed=int(args.optuna_seed))
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+
+    timeout = int(args.optuna_timeout) if int(args.optuna_timeout) > 0 else None
+    study.optimize(objective, n_trials=int(args.optuna_trials), timeout=timeout)
+
+    best = {
+        "best_value": float(study.best_value),
+        "best_params": dict(study.best_params),
+        "best_threshold": float(study.best_trial.user_attrs.get("best_threshold", 0.5)),
+        "best_iteration": int(study.best_trial.user_attrs.get("best_iteration", 0)),
+        "n_trials": int(len(study.trials)),
+    }
+
+    with open(os.path.join(run_dir, "optuna_best.json"), "w") as f:
+        json.dump(best, f, indent=2)
+
+    logger.info("")
+    logger.info("Optuna best result:")
+    logger.info(f"  ✓ Val Macro-F1: {best['best_value']:.4f}")
+    logger.info(f"  ✓ Best threshold: {best['best_threshold']:.4f}")
+    logger.info(f"  ✓ Best params: {best['best_params']}")
+
+    # Final run using best params (your normal pipeline saves everything)
+    final_name = f"{base_run_name}_optuna_best"
+    logger.info("")
+    logger.info("Running final training with Optuna best params...")
+    return run_experiment(feature_mode, tfidf_analyzer, final_name, lgbm_overrides=best["best_params"])
+
+
 # -----------------------------------
-# Main: single run or 4-way ablation
+# Main: single run or 4-way ablation or Optuna
 # -----------------------------------
 logger.info("")
 logger.info("=" * 80)
 logger.info("STARTING EXPERIMENTS")
 logger.info("=" * 80)
 
-if args.loo_language_out:
+if args.optuna:
+    logger.info("Running Optuna Bayesian optimization...")
+    run_optuna_search(args.features, args.tfidf_analyzer, args.run_name)
+elif args.loo_language_out:
     logger.info("Running leave-one-language-out evaluation...")
     run_leave_one_language_out(args.features, args.tfidf_analyzer, args.run_name)
 elif args.ablation:
